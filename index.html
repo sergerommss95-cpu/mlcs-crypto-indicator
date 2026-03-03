@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MLCS v5 — High-Conviction Filter System</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="./base.css">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <!-- Loading overlay -->
+  <div class="loading-overlay" id="loadingOverlay">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">Fetching market data…</div>
+  </div>
+
+  <div class="dashboard">
+    <!-- ═══ HEADER ═══ -->
+    <header class="dashboard-header">
+      <div class="header-left">
+        <div class="logo">
+          <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="MLCS Logo" width="32" height="32">
+            <rect x="2" y="2" width="28" height="28" rx="6" stroke="#06b6d4" stroke-width="2"/>
+            <path d="M8 22V14l4 5 4-5v8" stroke="#06b6d4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="24" cy="10" r="3" fill="#10b981" opacity="0.8"/>
+            <line x1="22" y1="15" x2="22" y2="24" stroke="#06b6d4" stroke-width="2" stroke-linecap="round"/>
+            <line x1="26" y1="18" x2="26" y2="24" stroke="#06b6d4" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <div>
+            <div class="logo-text">MLCS</div>
+            <div class="logo-subtitle">Multi-Layer Confirmation</div>
+          </div>
+        </div>
+
+        <div class="coin-toggle">
+          <button class="coin-btn active" data-coin="bitcoin" onclick="switchCoin('bitcoin')">BTC</button>
+          <button class="coin-btn" data-coin="ethereum" onclick="switchCoin('ethereum')">ETH</button>
+          <button class="coin-btn" data-coin="solana" onclick="switchCoin('solana')">SOL</button>
+          <button class="coin-btn" data-coin="sui" onclick="switchCoin('sui')">SUI</button>
+        </div>
+      </div>
+
+      <div class="header-center">
+        <div class="current-price" id="currentPrice">—</div>
+        <div class="price-change" id="priceChange">—</div>
+      </div>
+
+      <div class="header-right">
+        <div class="last-update" id="lastUpdate">—</div>
+        <button class="refresh-btn" onclick="refreshData()" title="Refresh data">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+            <path d="M13.65 2.35A8 8 0 1 0 15 8h-2a6 6 0 1 1-1.05-3.39l-1.6 1.6H15V2l-1.35.35z"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- ═══ CONVICTION PANEL ═══ -->
+    <section class="conviction-panel" id="convictionPanel">
+      <div class="conviction-score-ring">
+        <svg viewBox="0 0 120 120" class="ring-svg">
+          <circle cx="60" cy="60" r="50" fill="none" stroke="var(--surface-2)" stroke-width="10"/>
+          <circle cx="60" cy="60" r="50" fill="none" stroke="var(--accent)" stroke-width="10"
+                  stroke-dasharray="314" stroke-dashoffset="314"
+                  stroke-linecap="round" transform="rotate(-90 60 60)"
+                  class="ring-progress" id="ringProgress"/>
+        </svg>
+        <div class="ring-inner">
+          <div class="ring-value" id="ringValue">0</div>
+          <div class="ring-label">/ 6</div>
+        </div>
+      </div>
+
+      <div class="conviction-details">
+        <div class="conviction-title" id="convictionTitle">—</div>
+        <div class="conviction-subtitle" id="convictionSubtitle">—</div>
+        <div class="conviction-tags" id="convictionTags"></div>
+      </div>
+
+      <div class="signal-grid" id="signalGrid"></div>
+    </section>
+
+    <!-- ═══ TIMEFRAME TABS ═══ -->
+    <nav class="tf-nav" id="tfNav">
+      <button class="tf-btn active" data-tf="15m" onclick="switchTF('15m')">15m</button>
+      <button class="tf-btn" data-tf="1h" onclick="switchTF('1h')">1H</button>
+      <button class="tf-btn" data-tf="4h" onclick="switchTF('4h')">4H</button>
+      <button class="tf-btn" data-tf="1d" onclick="switchTF('1d')">1D</button>
+    </nav>
+
+    <!-- ═══ INDICATORS ═══ -->
+    <section class="indicators-grid" id="indicatorsGrid"></section>
+
+    <!-- ═══ SIGNAL TABLE ═══ -->
+    <section class="signal-section">
+      <div class="section-header">
+        <h2 class="section-title">Signal History</h2>
+        <span class="section-badge" id="signalCount">—</span>
+      </div>
+      <div class="signal-table-wrapper">
+        <table class="signal-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Type</th>
+              <th>Price</th>
+              <th>Conviction</th>
+              <th>Filters</th>
+            </tr>
+          </thead>
+          <tbody id="signalTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ═══ FOOTER ═══ -->
+    <footer class="dashboard-footer">
+      <span>MLCS v5 · Multi-Layer Confirmation System</span>
+      <span>Data: CoinGecko API · All times local</span>
+    </footer>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
