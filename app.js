@@ -1,1 +1,1 @@
-CONTENT_FROM_FILE_app_js
+LOAD_FROM:/home/user/workspace/CONTENT_app.txt
