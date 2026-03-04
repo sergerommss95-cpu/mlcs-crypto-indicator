@@ -2200,7 +2200,9 @@ function polyRecordWindowResult() {
   polyRenderHistory();
 }
 
-// ── Indicator Calculations ──
+// ── Indicator Calculations v2 ──
+// KEY CHANGES: Trend-following instead of contrarian, added OFI + ROC + EMA Trend + Whale Signal
+// Removed: BB Position (contrarian), Candle Pattern (noise at 1m scale)
 function calcPolyMicroIndicators() {
   if (polyTrades.length < 10) return null;
 
@@ -2210,19 +2212,45 @@ function calcPolyMicroIndicators() {
 
   const currentPrice = polyCurrentPrice || polyTrades[polyTrades.length - 1].price;
 
-  // 1. Tick Momentum — ratio of buy ticks in last 60s
-  const upTicks = recentTrades.filter(t => t.isBuy).length;
-  const tickMomentum = recentTrades.length > 0 ? upTicks / recentTrades.length : 0.5;
+  // 1. Order Flow Imbalance (OFI) — #1 short-term predictor (academic research)
+  // Dollar-weighted buy vs sell pressure over last 90 seconds
+  const ofiTrades = polyTrades.filter(t => t.time > now - 90000);
+  let buyDollarVol = 0, sellDollarVol = 0;
+  ofiTrades.forEach(t => {
+    const dv = t.qty * t.price;
+    if (t.isBuy) buyDollarVol += dv;
+    else sellDollarVol += dv;
+  });
+  const totalDollarVol = buyDollarVol + sellDollarVol;
+  const ofi = totalDollarVol > 0 ? buyDollarVol / totalDollarVol : 0.5;
 
-  // 2. Volume Imbalance — buy vol / total vol in last 60s
-  const buyVol = recentTrades.filter(t => t.isBuy).reduce((s, t) => s + t.qty * t.price, 0);
-  const totalVol = recentTrades.reduce((s, t) => s + t.qty * t.price, 0);
-  const volumeImbalance = totalVol > 0 ? buyVol / totalVol : 0.5;
+  // 2. Tick Momentum — ratio of up-ticks in last 30s (fast signal)
+  const fastTrades = polyTrades.filter(t => t.time > now - 30000);
+  let upTicks = 0;
+  for (let i = 1; i < fastTrades.length; i++) {
+    if (fastTrades[i].price > fastTrades[i-1].price) upTicks++;
+  }
+  const tickMomentum = fastTrades.length > 1 ? upTicks / (fastTrades.length - 1) : 0.5;
 
-  // 3. 1-min RSI(14) — reuse existing calcRSI
+  // 3. Volume-Weighted Tick Direction — big trades matter more
+  let volWeightedBuy = 0, volWeightedTotal = 0;
+  recentTrades.forEach(t => {
+    const w = t.qty * t.price;
+    volWeightedTotal += w;
+    if (t.isBuy) volWeightedBuy += w;
+  });
+  const volumeImbalance = volWeightedTotal > 0 ? volWeightedBuy / volWeightedTotal : 0.5;
+
+  // 4. Rate of Change (ROC) — price momentum over last 2 minutes
+  const twoMinAgo = polyTrades.filter(t => t.time > now - 120000 && t.time < now - 90000);
+  const refPrice = twoMinAgo.length > 0
+    ? twoMinAgo.reduce((s, t) => s + t.price, 0) / twoMinAgo.length
+    : null;
+  const roc = refPrice ? ((currentPrice - refPrice) / refPrice) * 100 : 0;
+
+  // 5. 1-min RSI(14) — TREND-FOLLOWING mode (v2 fix: no contrarian reversal)
   const closedCandles = polyCandles1m.filter(c => c.closed);
   const closes = closedCandles.map(c => c.close);
-  // Include current open candle's close for freshness
   const allCloses = polyCandles1m.length > 0
     ? [...closes, polyCandles1m[polyCandles1m.length - 1].close]
     : closes;
@@ -2234,7 +2262,7 @@ function calcPolyMicroIndicators() {
     if (lastRsi !== null) currentRsi = lastRsi;
   }
 
-  // 4. VWAP since window open
+  // 6. VWAP Position — trend-following (above = bullish, below = bearish)
   const windowTrades = polyWindowStartTime
     ? polyTrades.filter(t => t.time >= polyWindowStartTime)
     : polyTrades;
@@ -2243,18 +2271,7 @@ function calcPolyMicroIndicators() {
   const vwap = vwapDen > 0 ? vwapNum / vwapDen : currentPrice;
   const vwapDeviation = ((currentPrice - vwap) / vwap) * 100;
 
-  // 5. BB position on 1-min closes — reuse existing calcBollingerBands
-  let bbPosition = 0.5;
-  if (allCloses.length >= 20) {
-    const bbData = calcBollingerBands(allCloses, 20, 2);
-    const lastUpper = bbData.upper[bbData.upper.length - 1];
-    const lastLower = bbData.lower[bbData.lower.length - 1];
-    if (lastUpper !== null && lastLower !== null && lastUpper !== lastLower) {
-      bbPosition = (currentPrice - lastLower) / (lastUpper - lastLower);
-    }
-  }
-
-  // 6. Micro MACD(5,13,4) — reuse existing calcMACD
+  // 7. Micro MACD(5,13,4) — momentum direction
   let macdHist = 0;
   let macdHistRising = false;
   if (allCloses.length >= 15) {
@@ -2265,82 +2282,110 @@ function calcPolyMicroIndicators() {
     macdHistRising = macdHist > macdHistPrev;
   }
 
-  // 7. Candle pattern — last 3 closed 1-min candles
-  const lastThree = closedCandles.slice(-3);
-  let candleScore = 0;
-  if (lastThree.length > 0) {
-    lastThree.forEach(c => {
-      if (c.close > c.open) candleScore += 1 / 3;
-      else if (c.close < c.open) candleScore -= 1 / 3;
-    });
+  // 8. EMA Trend Alignment — multi-timeframe confirmation
+  let emaTrend = 0;
+  if (allCloses.length >= 13) {
+    const ema5 = calcEMA(allCloses, 5);
+    const ema13 = calcEMA(allCloses, 13);
+    const lastEma5 = ema5[ema5.length - 1];
+    const lastEma13 = ema13[ema13.length - 1];
+    const prevEma5 = ema5[ema5.length - 2];
+    const prevEma13 = ema13[ema13.length - 2];
+    if (lastEma5 > lastEma13 && prevEma5 > prevEma13) emaTrend = 1;
+    else if (lastEma5 < lastEma13 && prevEma5 < prevEma13) emaTrend = -1;
   }
 
-  // 8. Window deviation — how far price has moved from window open
+  // 9. Window Momentum — CONTINUATION (v2 fix: price up from open → likely closes UP)
   const windowDeviation = polyWindowOpenPrice
     ? ((currentPrice - polyWindowOpenPrice) / polyWindowOpenPrice) * 100
     : 0;
 
+  // 10. Large Trade Detector — whale activity in last 2 minutes
+  const recent2m = polyTrades.filter(t => t.time > now - 120000);
+  const avgTradeSize = recent2m.length > 0
+    ? recent2m.reduce((s, t) => s + t.qty, 0) / recent2m.length
+    : 0;
+  const largeTrades = recent2m.filter(t => t.qty > avgTradeSize * 5);
+  let largeTradeBias = 0;
+  largeTrades.forEach(t => { largeTradeBias += t.isBuy ? 1 : -1; });
+  const whaleSignal = largeTrades.length > 0
+    ? Math.max(-1, Math.min(1, largeTradeBias / Math.max(1, largeTrades.length)))
+    : 0;
+
   return {
+    ofi,
     tickMomentum,
     volumeImbalance,
+    roc,
     rsi1m: currentRsi,
     vwapDeviation,
-    bbPosition,
     macdHist,
     macdHistRising,
-    candleScore,
+    emaTrend,
     windowDeviation,
+    whaleSignal,
     currentPrice,
     vwap,
     windowOpenPrice: polyWindowOpenPrice
   };
 }
 
-// ── Signal Scoring ──
+// ── Signal Scoring v2 ──
 function calcPolymarketSignal(indicators) {
+  // v2 Scoring — Trend-following with Order Flow priority
+  // Weight allocation: OFI 25%, Window Momentum 18%, Tick 12%, Volume 10%, ROC 10%,
+  //                    VWAP 8%, RSI 7%, MACD 5%, EMA Trend 3%, Whale 2%
   let score = 50;
 
-  // Tick momentum (weight ~20)
-  if (indicators.tickMomentum > 0.58)      score += 15;
-  else if (indicators.tickMomentum > 0.55) score += 8;
-  else if (indicators.tickMomentum < 0.42) score -= 15;
-  else if (indicators.tickMomentum < 0.45) score -= 8;
-
-  // Volume imbalance (weight ~15)
-  if (indicators.volumeImbalance > 0.58)      score += 12;
-  else if (indicators.volumeImbalance > 0.55) score += 6;
-  else if (indicators.volumeImbalance < 0.42) score -= 12;
-  else if (indicators.volumeImbalance < 0.45) score -= 6;
-
-  // VWAP position (weight ~15)
-  if (indicators.vwapDeviation > 0.05)      score += 10;
-  else if (indicators.vwapDeviation > 0.02) score += 5;
-  else if (indicators.vwapDeviation < -0.05) score -= 10;
-  else if (indicators.vwapDeviation < -0.02) score -= 5;
-
-  // 1-min RSI contrarian at extremes (weight ~12)
-  if (indicators.rsi1m < 25)      score += 10;
-  else if (indicators.rsi1m < 35) score += 4;
-  else if (indicators.rsi1m > 75) score -= 10;
-  else if (indicators.rsi1m > 65) score -= 4;
-
-  // Micro MACD histogram (weight ~12)
-  if (indicators.macdHistRising && indicators.macdHist > 0)  score += 10;
-  else if (indicators.macdHistRising)                         score += 5;
-  else if (!indicators.macdHistRising && indicators.macdHist < 0) score -= 10;
-  else if (!indicators.macdHistRising)                        score -= 5;
-
-  // BB position (weight ~10)
-  if (indicators.bbPosition < 0.15)      score += 8;
-  else if (indicators.bbPosition > 0.85) score -= 8;
-
-  // Candle pattern (weight ~8)
-  score += indicators.candleScore * 6;
-
-  // Mean reversion from window open (weight ~8)
-  if (Math.abs(indicators.windowDeviation) > 0.15) {
-    score -= Math.sign(indicators.windowDeviation) * 6;
+  // Order Flow Imbalance (±12.5 pts) — PRIMARY SIGNAL
+  const ofiDelta = indicators.ofi - 0.5;
+  if (Math.abs(ofiDelta) > 0.03) {
+    score += ofiDelta * 80;
   }
+
+  // Window Momentum (±9 pts) — CONTINUATION, not mean reversion
+  const wd = indicators.windowDeviation;
+  if (Math.abs(wd) > 0.01) {
+    score += Math.max(-9, Math.min(9, wd * 90));
+  }
+
+  // Tick Momentum (±6 pts)
+  const tmDelta = indicators.tickMomentum - 0.5;
+  if (Math.abs(tmDelta) > 0.05) {
+    score += tmDelta * 40;
+  }
+
+  // Volume Imbalance (±5 pts)
+  const viDelta = indicators.volumeImbalance - 0.5;
+  if (Math.abs(viDelta) > 0.03) {
+    score += viDelta * 34;
+  }
+
+  // Rate of Change (±5 pts)
+  if (Math.abs(indicators.roc) > 0.005) {
+    score += Math.max(-5, Math.min(5, indicators.roc * 50));
+  }
+
+  // VWAP Position (±4 pts) — trend-following
+  if (Math.abs(indicators.vwapDeviation) > 0.01) {
+    score += Math.max(-4, Math.min(4, indicators.vwapDeviation * 40));
+  }
+
+  // RSI Momentum (±3.5 pts) — TREND-FOLLOWING
+  const rsiDelta = (indicators.rsi1m - 50) / 50;
+  score += rsiDelta * 3.5;
+
+  // Micro MACD (±2.5 pts)
+  if (indicators.macdHistRising && indicators.macdHist > 0)       score += 2.5;
+  else if (indicators.macdHistRising && indicators.macdHist <= 0) score += 1;
+  else if (!indicators.macdHistRising && indicators.macdHist < 0) score -= 2.5;
+  else if (!indicators.macdHistRising && indicators.macdHist >= 0) score -= 1;
+
+  // EMA Trend Alignment (±1.5 pts)
+  score += indicators.emaTrend * 1.5;
+
+  // Whale Signal (±1 pt)
+  score += indicators.whaleSignal * 1;
 
   return Math.max(0, Math.min(100, Math.round(score)));
 }
@@ -2487,46 +2532,54 @@ function polyRenderIndicators(ind) {
 
   const rows = [
     {
+      name: 'Order Flow',
+      value: `${(ind.ofi * 100).toFixed(1)}% buy`,
+      signal: ind.ofi > 0.53 ? 'up' : ind.ofi < 0.47 ? 'down' : 'neutral'
+    },
+    {
+      name: 'Window Trend',
+      value: `${ind.windowDeviation >= 0 ? '+' : ''}${ind.windowDeviation.toFixed(3)}%`,
+      signal: ind.windowDeviation > 0.01 ? 'up' : ind.windowDeviation < -0.01 ? 'down' : 'neutral'
+    },
+    {
       name: 'Tick Momentum',
-      value: `${(ind.tickMomentum * 100).toFixed(1)}% buy`,
+      value: `${(ind.tickMomentum * 100).toFixed(1)}% up`,
       signal: ind.tickMomentum > 0.55 ? 'up' : ind.tickMomentum < 0.45 ? 'down' : 'neutral'
     },
     {
-      name: '1-Min RSI (14)',
-      value: ind.rsi1m.toFixed(1),
-      signal: ind.rsi1m < 35 ? 'up' : ind.rsi1m > 65 ? 'down' : 'neutral'
-    },
-    {
-      name: 'VWAP Position',
-      value: `${ind.vwapDeviation >= 0 ? '+' : ''}${ind.vwapDeviation.toFixed(3)}%`,
-      signal: ind.vwapDeviation > 0.02 ? 'up' : ind.vwapDeviation < -0.02 ? 'down' : 'neutral'
-    },
-    {
-      name: 'Volume Imbalance',
+      name: 'Vol Imbalance',
       value: `${(ind.volumeImbalance * 100).toFixed(1)}% buy`,
-      signal: ind.volumeImbalance > 0.55 ? 'up' : ind.volumeImbalance < 0.45 ? 'down' : 'neutral'
+      signal: ind.volumeImbalance > 0.53 ? 'up' : ind.volumeImbalance < 0.47 ? 'down' : 'neutral'
     },
     {
-      name: 'BB Position',
-      value: `${(ind.bbPosition * 100).toFixed(1)}%`,
-      signal: ind.bbPosition < 0.2 ? 'up' : ind.bbPosition > 0.8 ? 'down' : 'neutral'
+      name: 'Price ROC',
+      value: `${ind.roc >= 0 ? '+' : ''}${ind.roc.toFixed(4)}%`,
+      signal: ind.roc > 0.005 ? 'up' : ind.roc < -0.005 ? 'down' : 'neutral'
     },
     {
-      name: 'Micro MACD Hist',
+      name: 'VWAP',
+      value: `${ind.vwapDeviation >= 0 ? '+' : ''}${ind.vwapDeviation.toFixed(3)}%`,
+      signal: ind.vwapDeviation > 0.01 ? 'up' : ind.vwapDeviation < -0.01 ? 'down' : 'neutral'
+    },
+    {
+      name: 'RSI(14)',
+      value: ind.rsi1m.toFixed(1),
+      signal: ind.rsi1m > 55 ? 'up' : ind.rsi1m < 45 ? 'down' : 'neutral'
+    },
+    {
+      name: 'MACD',
       value: ind.macdHist.toFixed(4),
       signal: (ind.macdHistRising && ind.macdHist > 0) ? 'up' : (!ind.macdHistRising && ind.macdHist < 0) ? 'down' : 'neutral'
     },
     {
-      name: 'Candle Pattern',
-      value: ind.candleScore > 0.5 ? 'Bullish' : ind.candleScore < -0.5 ? 'Bearish' : 'Mixed',
-      signal: ind.candleScore > 0.3 ? 'up' : ind.candleScore < -0.3 ? 'down' : 'neutral'
+      name: 'EMA Trend',
+      value: ind.emaTrend > 0 ? 'Bullish' : ind.emaTrend < 0 ? 'Bearish' : 'Flat',
+      signal: ind.emaTrend > 0 ? 'up' : ind.emaTrend < 0 ? 'down' : 'neutral'
     },
     {
-      name: 'Window Spread',
-      value: `${ind.windowDeviation >= 0 ? '+' : ''}${ind.windowDeviation.toFixed(3)}%`,
-      signal: Math.abs(ind.windowDeviation) > 0.15
-        ? (ind.windowDeviation > 0 ? 'down' : 'up')  // mean reversion
-        : 'neutral'
+      name: 'Whale Flow',
+      value: ind.whaleSignal > 0 ? 'Buying' : ind.whaleSignal < 0 ? 'Selling' : 'Quiet',
+      signal: ind.whaleSignal > 0.3 ? 'up' : ind.whaleSignal < -0.3 ? 'down' : 'neutral'
     }
   ];
 
