@@ -1692,3 +1692,73 @@ html, body {
   color: var(--color-text-2);
   margin-top: 4px;
 }
+
+/* v5.0: Self-Learning Weights Panel */
+.poly-learn-card {
+  border: 1px solid rgba(99, 102, 241, 0.25);
+}
+.poly-learn-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.poly-learn-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #a78bfa;
+  letter-spacing: 0.02em;
+}
+.poly-learn-regime {
+  font-size: 10px;
+  color: var(--color-text-2);
+}
+.poly-learn-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.poly-learn-row {
+  display: grid;
+  grid-template-columns: 80px 1fr 55px;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+.poly-learn-name {
+  font-size: 11px;
+  color: var(--color-text-2);
+}
+.poly-learn-bar-bg {
+  height: 6px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.poly-learn-bar {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s ease, background 0.5s ease;
+}
+.poly-learn-val {
+  font-size: 11px;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  color: var(--color-text-1);
+  text-align: right;
+}
+.poly-learn-calib {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  font-size: 10px;
+  color: var(--color-text-2);
+}
+.poly-learn-empty {
+  font-size: 11px;
+  color: var(--color-text-2);
+  text-align: center;
+  padding: 8px 0;
+  line-height: 1.5;
+}
