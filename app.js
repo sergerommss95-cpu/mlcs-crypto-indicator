@@ -2166,10 +2166,22 @@ function polySyncToWindow() {
         if (ind) {
           const score = calcPolymarketSignal(ind);
           let label = polyScoreToLabel(score);
-          // v3.1: Apply LOW confidence gate — force NEUTRAL if LOW conf
+          // v4.0: Regime-adaptive confidence with cross-indicator consensus
+          const scored = [ind.minuteSignal, ind.netFlowSignal, ind.tickMomSignal,
+            ind.roc > 0.005 ? 'bullish' : ind.roc < -0.005 ? 'bearish' : 'neutral',
+            (ind.macdHistRising && ind.macdHist > 0) ? 'bullish' : (!ind.macdHistRising && ind.macdHist < 0) ? 'bearish' : 'neutral',
+            ind.spikeSignal, ind.whaleSignal];
+          const bc = scored.filter(s => s === 'bullish' || s === 'up').length;
+          const brc = scored.filter(s => s === 'bearish' || s === 'down').length;
+          const agr = Math.max(bc, brc);
+          const consensus = agr >= 5 ? 'strong' : agr >= 4 ? 'moderate' : 'weak';
+          const minStreakHigh = ind.regime === 'volatile' ? 4 : 3;
           let confLevel = 'LOW';
-          if (ind.minuteStreak >= 3 && (score >= 65 || score <= 35) && !ind.streakExhausting) confLevel = 'HIGH';
-          else if (ind.minuteStreak >= 2 && (score >= 62 || score <= 38)) confLevel = 'MED';
+          if (ind.minuteStreak >= minStreakHigh && (score >= 65 || score <= 35) && !ind.streakExhausting) {
+            confLevel = consensus !== 'weak' ? 'HIGH' : 'MED';
+          } else if (ind.minuteStreak >= 2 && (score >= 62 || score <= 38) && consensus !== 'weak') {
+            confLevel = 'MED';
+          }
           if (ind.lowVolatility) confLevel = 'LOW';
           const gated = confLevel === 'LOW' || ind.streakExhausting;
           if (gated) label = 'NEUTRAL';
@@ -2302,21 +2314,140 @@ function calcPolyMicroIndicators() {
     lowVolatility = volRangePercent < 0.008;
   }
 
-  // v3.1: Streak Exhaustion Detection
-  // After 3+ same-dir streak, check if NetFlow + TickMom diverge from streak
+  // v4.0: Regime Detection
+  let regime = 'ranging';
+  let regimeStrength = 0;
+  let regimeRangePercent = 0;
+  let regimeDirectionalRatio = 0;
+  if (closedCandles.length >= 5) {
+    const lookback = Math.min(10, closedCandles.length);
+    const recentRegime = closedCandles.slice(-lookback);
+    const regimeCloses = recentRegime.map(c => c.close);
+    const rHigh = Math.max(...recentRegime.map(c => c.high));
+    const rLow = Math.min(...recentRegime.map(c => c.low));
+    const rMean = regimeCloses.reduce((a, b) => a + b, 0) / regimeCloses.length;
+    regimeRangePercent = rMean > 0 ? ((rHigh - rLow) / rMean) * 100 : 0;
+    let netMove = 0, totalMove = 0;
+    for (const c of recentRegime) {
+      const move = c.close - c.open;
+      netMove += move;
+      totalMove += Math.abs(move);
+    }
+    regimeDirectionalRatio = totalMove > 0 ? Math.abs(netMove) / totalMove : 0;
+    if (regimeRangePercent > 0.08) {
+      regime = 'volatile';
+      regimeStrength = Math.min(regimeRangePercent / 0.15, 1);
+    } else if (regimeDirectionalRatio > 0.55 && regimeRangePercent > 0.02) {
+      regime = 'trending';
+      regimeStrength = regimeDirectionalRatio;
+    } else {
+      regime = 'ranging';
+      regimeStrength = 1 - regimeDirectionalRatio;
+    }
+  }
+
+  // v4.0: Spike Detection
+  const spikeTrades = polyTrades.filter(t => t.time > now - 60000);
+  let hasSpike = false;
+  let spikeSignal = 'neutral';
+  let spikeMagnitude = 0;
+  if (spikeTrades.length >= 10) {
+    const latestPrice = spikeTrades[spikeTrades.length - 1].price;
+    let maxMove = 0;
+    let moveFromPrice = latestPrice;
+    for (let i = 0; i < spikeTrades.length - 1; i++) {
+      const move = latestPrice - spikeTrades[i].price;
+      if (Math.abs(move) > Math.abs(maxMove)) {
+        maxMove = move;
+        moveFromPrice = spikeTrades[i].price;
+      }
+    }
+    const spikePct = moveFromPrice > 0 ? (maxMove / moveFromPrice) * 100 : 0;
+    spikeMagnitude = Math.abs(spikePct);
+    hasSpike = spikeMagnitude > 0.03;
+    if (hasSpike) {
+      const spikeUp = spikePct > 0;
+      if (regime === 'trending') {
+        spikeSignal = spikeUp ? 'bullish' : 'bearish';
+      } else if (regime === 'ranging') {
+        spikeSignal = spikeUp ? 'bearish' : 'bullish'; // mean reversion
+      } else {
+        spikeSignal = spikeUp ? 'bullish' : 'bearish';
+      }
+    }
+  }
+
+  // v4.0: Volume Anomaly (Whale) Detection
+  let hasWhaleTrade = false;
+  let whaleSignal = 'neutral';
+  let whaleMagnitude = 0;
+  if (nfTrades.length >= 20) {
+    const dollarVols = nfTrades.map(t => t.qty * t.price);
+    const avgDV = dollarVols.reduce((a, b) => a + b, 0) / dollarVols.length;
+    const halfLen = Math.floor(nfTrades.length / 2);
+    const recentNf = nfTrades.slice(-halfLen);
+    let maxWhaleVol = 0;
+    let whaleT = null;
+    for (const t of recentNf) {
+      const dv = t.qty * t.price;
+      if (dv > maxWhaleVol) { maxWhaleVol = dv; whaleT = t; }
+    }
+    whaleMagnitude = avgDV > 0 ? maxWhaleVol / avgDV : 0;
+    hasWhaleTrade = whaleMagnitude > 5;
+    if (hasWhaleTrade && whaleT) {
+      whaleSignal = whaleT.isBuy ? 'bullish' : 'bearish';
+    }
+  }
+
+  // v4.0: RSI(5) for enhanced exhaustion
+  let rsi5 = null;
+  const rsiCloses = closedCandles.slice(-7).map(c => c.close);
+  if (rsiCloses.length >= 6) {
+    let rAvgGain = 0, rAvgLoss = 0;
+    for (let i = 1; i <= 5 && i < rsiCloses.length; i++) {
+      const ch = rsiCloses[i] - rsiCloses[i-1];
+      if (ch > 0) rAvgGain += ch; else rAvgLoss += Math.abs(ch);
+    }
+    rAvgGain /= 5; rAvgLoss /= 5;
+    for (let i = 6; i < rsiCloses.length; i++) {
+      const ch = rsiCloses[i] - rsiCloses[i-1];
+      rAvgGain = (rAvgGain * 4 + (ch > 0 ? ch : 0)) / 5;
+      rAvgLoss = (rAvgLoss * 4 + (ch < 0 ? Math.abs(ch) : 0)) / 5;
+    }
+    rsi5 = rAvgLoss === 0 ? 100 : 100 - (100 / (1 + rAvgGain / rAvgLoss));
+  }
+
+  // v4.0: Enhanced Streak Exhaustion (regime + RSI aware)
   let streakExhausting = false;
   let streakDampened = false;
   let exhaustionReason = null;
   if (minuteStreak >= 3 && minuteDir !== 0) {
     const streakBullish = minuteDir > 0;
-    const nfDiverges = streakBullish ? netFlowSignal === 'bearish' : netFlowSignal === 'bullish';
-    const tickDiverges = streakBullish ? tickMomSignal === 'bearish' : tickMomSignal === 'bullish';
-    if (nfDiverges && tickDiverges) {
+    // v4.0: In RANGING regime, 4+ streak = automatic mean reversion warning
+    if (regime === 'ranging' && minuteStreak >= 4) {
       streakExhausting = true;
-      exhaustionReason = `${minuteStreak}× ${streakBullish ? '↑' : '↓'} but flow reversing`;
-    } else if (nfDiverges || tickDiverges) {
-      streakDampened = true;
-      exhaustionReason = `${minuteStreak}× ${streakBullish ? '↑' : '↓'} partial divergence`;
+      exhaustionReason = `${minuteStreak}× ${streakBullish ? '↑' : '↓'} in RANGING — mean reversion`;
+    }
+    // v4.0: RSI(5) overbought/oversold confirms exhaustion
+    else if (rsi5 !== null && streakBullish && rsi5 > 80) {
+      streakExhausting = true;
+      exhaustionReason = `${minuteStreak}×↑ + RSI(5)=${rsi5.toFixed(1)} overbought`;
+    }
+    else if (rsi5 !== null && !streakBullish && rsi5 < 20) {
+      streakExhausting = true;
+      exhaustionReason = `${minuteStreak}×↓ + RSI(5)=${rsi5.toFixed(1)} oversold`;
+    }
+    // Original flow divergence checks (preserved from v3.1)
+    else {
+      const nfDiverges = streakBullish ? netFlowSignal === 'bearish' : netFlowSignal === 'bullish';
+      const tickDiverges = streakBullish ? tickMomSignal === 'bearish' : tickMomSignal === 'bullish';
+      if (nfDiverges && tickDiverges) {
+        streakExhausting = true;
+        exhaustionReason = `${minuteStreak}× ${streakBullish ? '↑' : '↓'} but flow reversing`;
+      } else if (nfDiverges || tickDiverges) {
+        streakDampened = true;
+        exhaustionReason = `${minuteStreak}× ${streakBullish ? '↑' : '↓'} partial divergence`;
+      }
     }
   }
 
@@ -2339,51 +2470,69 @@ function calcPolyMicroIndicators() {
     // v3.1 fields
     streakExhausting,
     streakDampened,
-    exhaustionReason
+    exhaustionReason,
+    // v4.0 fields
+    regime,
+    regimeStrength,
+    regimeRangePercent,
+    regimeDirectionalRatio,
+    hasSpike,
+    spikeSignal,
+    spikeMagnitude,
+    hasWhaleTrade,
+    whaleSignal,
+    whaleMagnitude,
+    rsi5
   };
 }
 
-// ── Signal Scoring v3.1 ──
+// ── Signal Scoring v4.0 ──
 function calcPolymarketSignal(ind) {
-  // v3.1 point-based scoring, starting at 50 (neutral)
+  // v4.0 regime-adaptive scoring
   let score = 50;
 
-  // 1. MinuteDirection Consistency (±20 pts + ±5 bonus for 4-streak)
-  // v3.1: Dampen if streak is exhausting
+  // Get regime weight multipliers
+  const rw = {
+    trending: { minuteDir: 1.25, netFlow: 0.75, windowTrend: 1.0, tickMom: 1.0, roc: 1.0, macd: 1.0, spike: 0.5, whale: 1.0, scoreMult: 1.1 },
+    ranging:  { minuteDir: 0.70, netFlow: 1.25, windowTrend: 0.80, tickMom: 1.0, roc: 1.0, macd: 1.2, spike: 1.5, whale: 1.2, scoreMult: 0.9 },
+    volatile: { minuteDir: 0.90, netFlow: 1.0, windowTrend: 0.70, tickMom: 1.0, roc: 0.80, macd: 0.80, spike: 0.80, whale: 1.3, scoreMult: 0.80 },
+  };
+  const w = rw[ind.regime] || rw.ranging;
+
+  // 1. MinuteDirection (±20 pts × regime)
   if (ind.minuteStreak >= 3) {
-    if (ind.streakExhausting) {
-      score += ind.minuteDir * 8; // dampened from 20 to 8
-    } else if (ind.streakDampened) {
-      score += ind.minuteDir * 14; // slightly dampened
-    } else {
-      score += ind.minuteDir * 20;
-    }
+    if (ind.streakExhausting) score += ind.minuteDir * 8 * w.minuteDir;
+    else if (ind.streakDampened) score += ind.minuteDir * 14 * w.minuteDir;
+    else score += ind.minuteDir * 20 * w.minuteDir;
   }
   if (ind.minuteStreak >= 4 && !ind.streakExhausting) {
-    score += ind.minuteDir * 5;
+    score += ind.minuteDir * 5 * w.minuteDir;
   }
-
-  // 2. NetFlow (±10 pts)
-  score += Math.max(-10, Math.min(10, ind.netFlowVal * 50));
-
-  // 3. Window Trend (±7.5 pts)
-  score += Math.max(-7.5, Math.min(7.5, ind.windowDev * 75));
-
-  // 4. Tick Momentum (±5 pts)
+  // 2. NetFlow (±10 pts × regime)
+  score += Math.max(-10, Math.min(10, ind.netFlowVal * 50 * w.netFlow));
+  // 3. Window Trend (±7.5 pts × regime)
+  score += Math.max(-7.5, Math.min(7.5, ind.windowDev * 75 * w.windowTrend));
+  // 4. Tick Momentum (±5 pts × regime)
   const tickDelta = (ind.tickMom || 0.5) - 0.5;
-  score += Math.max(-5, Math.min(5, tickDelta * 10));
-
-  // 5. ROC (±4 pts)
-  score += Math.max(-4, Math.min(4, ind.roc * 40));
-
-  // 6. MicroMACD (±2.5 pts)
+  score += Math.max(-5, Math.min(5, tickDelta * 10 * w.tickMom));
+  // 5. ROC (±4 pts × regime)
+  score += Math.max(-4, Math.min(4, ind.roc * 40 * w.roc));
+  // 6. MicroMACD (±2.5 pts × regime)
   const macdFalling = !ind.macdHistRising;
-  if (ind.macdHist > 0 && ind.macdHistRising) score += 2.5;
-  else if (ind.macdHist < 0 && macdFalling) score -= 2.5;
-  else if (ind.macdHist > 0) score += 1.0;
-  else if (ind.macdHist < 0) score -= 1.0;
-
-  // 7. Volatility Gate — override to neutral
+  const mm = w.macd;
+  if (ind.macdHist > 0 && ind.macdHistRising) score += 2.5 * mm;
+  else if (ind.macdHist < 0 && macdFalling) score -= 2.5 * mm;
+  else if (ind.macdHist > 0) score += 1.0 * mm;
+  else if (ind.macdHist < 0) score -= 1.0 * mm;
+  // 7. v4.0: Spike (±3 pts × regime)
+  if (ind.spikeSignal === 'bullish') score += 3 * w.spike;
+  else if (ind.spikeSignal === 'bearish') score -= 3 * w.spike;
+  // 8. v4.0: Whale (±2 pts × regime)
+  if (ind.whaleSignal === 'bullish') score += 2 * w.whale;
+  else if (ind.whaleSignal === 'bearish') score -= 2 * w.whale;
+  // 9. Apply regime score multiplier
+  score = 50 + (score - 50) * w.scoreMult;
+  // 10. Volatility Gate
   if (ind.lowVolatility) score = 50;
 
   return Math.max(0, Math.min(100, Math.round(score)));
@@ -2474,7 +2623,8 @@ function updatePolyPanel() {
       ? ` • streak: ${ind.minuteStreak}× ${ind.minuteDir > 0 ? '↑' : '↓'}`
       : '';
     const exhaustInfo = ind.streakExhausting ? ' • ⚠ EXHAUSTION' : ind.streakDampened ? ' • ⚡ dampened' : '';
-    dataStatusEl.textContent = `v3.1 Live • ${polyTrades.length} trades • ${polyCandles1m.filter(c => c.closed).length} candles${streakInfo}${exhaustInfo}`;
+    const regimeTag = ind.regime ? ` • ${ind.regime.toUpperCase()}` : '';
+    dataStatusEl.textContent = `v4.0 Live • ${polyTrades.length} trades • ${polyCandles1m.filter(c => c.closed).length} candles${streakInfo}${exhaustInfo}${regimeTag}`;
   }
 
   const score = calcPolymarketSignal(ind);
@@ -2495,17 +2645,27 @@ function updatePolyPanel() {
     }
   }
 
-  // Update signal text with v3 confidence logic
+  // Update signal text with v4.0 confidence logic
   const signalEl = document.getElementById('polySignalText');
   if (signalEl) {
-    // v3.1 confidence: HIGH needs streak≥3 + score≥65/≤35 + no exhaustion, MEDIUM needs streak≥2 + score≥62/≤38
+    // v4.0 confidence: regime-adaptive + consensus-aware
+    const scored = [ind.minuteSignal, ind.netFlowSignal, ind.tickMomSignal,
+      ind.roc > 0.005 ? 'bullish' : ind.roc < -0.005 ? 'bearish' : 'neutral',
+      (ind.macdHistRising && ind.macdHist > 0) ? 'bullish' : (!ind.macdHistRising && ind.macdHist < 0) ? 'bearish' : 'neutral',
+      ind.spikeSignal || 'neutral', ind.whaleSignal || 'neutral'];
+    const bc = scored.filter(s => s === 'bullish' || s === 'up').length;
+    const brc = scored.filter(s => s === 'bearish' || s === 'down').length;
+    const agr = Math.max(bc, brc);
+    const consensus = agr >= 5 ? 'strong' : agr >= 4 ? 'moderate' : 'weak';
+    const minStreakHigh = ind.regime === 'volatile' ? 4 : 3;
     let confLevel = 'LOW';
-    if (ind.minuteStreak >= 3 && (score >= 65 || score <= 35) && !ind.streakExhausting) confLevel = 'HIGH';
-    else if (ind.minuteStreak >= 2 && (score >= 62 || score <= 38)) confLevel = 'MED';
+    if (ind.minuteStreak >= minStreakHigh && (score >= 65 || score <= 35) && !ind.streakExhausting) {
+      confLevel = consensus !== 'weak' ? 'HIGH' : 'MED';
+    } else if (ind.minuteStreak >= 2 && (score >= 62 || score <= 38) && consensus !== 'weak') {
+      confLevel = 'MED';
+    }
     if (ind.lowVolatility) confLevel = 'LOW';
 
-    // v3.1 CRITICAL: LOW confidence gate — force NEUTRAL (skip trade)
-    // LOW confidence was 25% accurate in live testing — worse than coin flip
     const lowConfGated = confLevel === 'LOW';
 
     if (ind.lowVolatility) {
@@ -2521,10 +2681,10 @@ function updatePolyPanel() {
       signalEl.textContent = 'NEUTRAL — No edge';
       signalEl.style.color = '#9ca3af';
     } else if (score >= 55) {
-      signalEl.textContent = `UP (${confLevel}) — Score ${score}/100`;
+      signalEl.textContent = `UP (${confLevel}) — ${score}/100 [${ind.regime}]`;
       signalEl.style.color = '#10b981';
     } else {
-      signalEl.textContent = `DOWN (${confLevel}) — Score ${score}/100`;
+      signalEl.textContent = `DOWN (${confLevel}) — ${score}/100 [${ind.regime}]`;
       signalEl.style.color = '#ef4444';
     }
   }
@@ -2551,7 +2711,7 @@ function polyRenderIndicators(ind) {
   const grid = document.getElementById('polyIndGrid');
   if (!grid) return;
 
-  // v3: 6 scored indicators + volatility gate (7 rows)
+  // v4.0: 7 scored indicators + volatility gate + regime/spike/whale/RSI
   const streakLabel = ind.minuteStreak >= 2
     ? `${ind.minuteStreak}× ${ind.minuteDir > 0 ? '↑' : '↓'}`
     : 'Mixed';
@@ -2591,6 +2751,26 @@ function polyRenderIndicators(ind) {
       name: 'Vol Gate',
       value: ind.volRangePercent !== null ? `${ind.volRangePercent.toFixed(4)}%` : '—',
       signal: ind.lowVolatility ? 'down' : 'up'
+    },
+    {
+      name: 'Regime',
+      value: `${(ind.regime || '?').toUpperCase()} (${(ind.regimeStrength || 0).toFixed(2)})`,
+      signal: ind.regime === 'trending' ? 'up' : ind.regime === 'volatile' ? 'down' : 'neutral'
+    },
+    {
+      name: 'Spike (3%)',
+      value: ind.hasSpike ? `${ind.spikeMagnitude.toFixed(4)}%` : 'none',
+      signal: ind.spikeSignal === 'bullish' ? 'up' : ind.spikeSignal === 'bearish' ? 'down' : 'neutral'
+    },
+    {
+      name: 'Whale',
+      value: ind.hasWhaleTrade ? `${ind.whaleMagnitude.toFixed(1)}× avg` : 'normal',
+      signal: ind.whaleSignal === 'bullish' ? 'up' : ind.whaleSignal === 'bearish' ? 'down' : 'neutral'
+    },
+    {
+      name: 'RSI(5)',
+      value: ind.rsi5 !== null ? ind.rsi5.toFixed(1) : '—',
+      signal: ind.rsi5 !== null ? (ind.rsi5 > 70 ? 'up' : ind.rsi5 < 30 ? 'down' : 'neutral') : 'neutral'
     }
   ];
 
