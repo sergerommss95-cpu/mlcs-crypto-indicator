@@ -2165,7 +2165,15 @@ function polySyncToWindow() {
         const ind = calcPolyMicroIndicators();
         if (ind) {
           const score = calcPolymarketSignal(ind);
-          polyPendingPrediction = { score, label: polyScoreToLabel(score) };
+          let label = polyScoreToLabel(score);
+          // v3.1: Apply LOW confidence gate — force NEUTRAL if LOW conf
+          let confLevel = 'LOW';
+          if (ind.minuteStreak >= 3 && (score >= 65 || score <= 35) && !ind.streakExhausting) confLevel = 'HIGH';
+          else if (ind.minuteStreak >= 2 && (score >= 62 || score <= 38)) confLevel = 'MED';
+          if (ind.lowVolatility) confLevel = 'LOW';
+          const gated = confLevel === 'LOW' || ind.streakExhausting;
+          if (gated) label = 'NEUTRAL';
+          polyPendingPrediction = { score, label, confLevel, gated };
         }
       }
     }, timeToCapture);
@@ -2183,7 +2191,9 @@ function polyRecordWindowResult() {
   if (!polyWindowOpenPrice || !polyCurrentPrice) return;
   const actual = polyCurrentPrice >= polyWindowOpenPrice ? 'UP' : 'DOWN';
   const prediction = polyPendingPrediction ? polyPendingPrediction.label : null;
-  const correct = prediction ? (prediction === 'UP' || prediction === 'LEAN UP' ? 'UP' : 'DOWN') === actual : null;
+  // v3.1: NEUTRAL predictions (gated) count as "skip" — not judged for accuracy
+  const isSkip = !prediction || prediction === 'NEUTRAL';
+  const correct = isSkip ? null : (prediction === 'UP' || prediction === 'LEAN UP' ? 'UP' : 'DOWN') === actual;
 
   // Format window time label
   const windowLabel = polyFormatET(polyWindowStartTime);
@@ -2192,17 +2202,18 @@ function polyRecordWindowResult() {
     time: windowLabel,
     prediction: prediction || '—',
     actual,
-    correct
+    correct,
+    gated: polyPendingPrediction ? polyPendingPrediction.gated : false
   });
 
-  if (polySessionHistory.length > 10) polySessionHistory.pop();
+  if (polySessionHistory.length > 20) polySessionHistory.pop(); // v3.1: keep more history
   polyPendingPrediction = null;
   polyRenderHistory();
 }
 
 // ── Indicator Calculations v3 ──
-// v3 CHANGES: MinuteDirection primary (40%), merged OFI+VolImb → NetFlow, removed RSI/VWAP/EMA/Whale
-// Added VolatilityGate to skip low-vol random-walk conditions
+// v3.1 CHANGES: LOW conf gate, streak exhaustion detection, tighter vol threshold
+// v3 base: MinuteDirection primary (40%), merged OFI+VolImb → NetFlow, removed RSI/VWAP/EMA/Whale
 function calcPolyMicroIndicators() {
   if (polyTrades.length < 10) return null;
 
@@ -2214,9 +2225,8 @@ function calcPolyMicroIndicators() {
   const closedCandles = polyCandles1m.filter(c => c.closed);
 
   // 1. MinuteDirection Consistency — PRIMARY SIGNAL (40% weight)
-  // Counts consecutive same-direction 1-min candles. 4-streak = 96.83% win rate.
   let minuteStreak = 0;
-  let minuteDir = 0; // +1 up, -1 down, 0 flat
+  let minuteDir = 0;
   if (closedCandles.length >= 3) {
     const lookback = Math.min(4, closedCandles.length);
     const recent = closedCandles.slice(-lookback);
@@ -2234,7 +2244,6 @@ function calcPolyMicroIndicators() {
     : (minuteStreak >= 3 && minuteDir === -1) ? 'down' : 'neutral';
 
   // 2. NetFlow — merged OFI + VolumeImbalance (20% weight)
-  // Uses (B-S)/(B+S) formula, symmetric around zero
   const nfTrades = polyTrades.filter(t => t.time > now - 90000);
   let buyDollarVol = 0, sellDollarVol = 0;
   nfTrades.forEach(t => {
@@ -2244,21 +2253,23 @@ function calcPolyMicroIndicators() {
   });
   const totalDollarVol = buyDollarVol + sellDollarVol;
   const netFlowVal = totalDollarVol > 0 ? (buyDollarVol - sellDollarVol) / totalDollarVol : 0;
+  const netFlowSignal = netFlowVal > 0.05 ? 'bullish' : netFlowVal < -0.05 ? 'bearish' : 'neutral';
 
   // 3. Window Trend (15% weight)
   const windowDev = polyWindowOpenPrice
     ? (currentPrice - polyWindowOpenPrice) / polyWindowOpenPrice
     : 0;
 
-  // 4. Tick Momentum (10% weight) — ratio of up-ticks in last 30s
+  // 4. Tick Momentum (10% weight)
   const fastTrades = polyTrades.filter(t => t.time > now - 30000);
   let upTicks = 0;
   for (let i = 1; i < fastTrades.length; i++) {
     if (fastTrades[i].price > fastTrades[i-1].price) upTicks++;
   }
   const tickMom = fastTrades.length > 1 ? upTicks / (fastTrades.length - 1) : 0.5;
+  const tickMomSignal = tickMom > 0.55 ? 'bullish' : tickMom < 0.45 ? 'bearish' : 'neutral';
 
-  // 5. Rate of Change (8% weight) — 2-min price momentum
+  // 5. Rate of Change (8% weight)
   const twoMinAgo = polyTrades.filter(t => t.time > now - 120000 && t.time < now - 90000);
   const refPrice = twoMinAgo.length > 0
     ? twoMinAgo.reduce((s, t) => s + t.price, 0) / twoMinAgo.length
@@ -2280,6 +2291,7 @@ function calcPolyMicroIndicators() {
   }
 
   // 7. Volatility Gate (filter — not scored)
+  // v3.1: tighter threshold 0.008% (was 0.01%)
   let lowVolatility = false;
   let volRangePercent = null;
   if (closedCandles.length >= 3 && currentPrice) {
@@ -2287,7 +2299,25 @@ function calcPolyMicroIndicators() {
     const high = Math.max(...recentC.map(c => c.high));
     const low = Math.min(...recentC.map(c => c.low));
     volRangePercent = ((high - low) / currentPrice) * 100;
-    lowVolatility = volRangePercent < 0.01;
+    lowVolatility = volRangePercent < 0.008;
+  }
+
+  // v3.1: Streak Exhaustion Detection
+  // After 3+ same-dir streak, check if NetFlow + TickMom diverge from streak
+  let streakExhausting = false;
+  let streakDampened = false;
+  let exhaustionReason = null;
+  if (minuteStreak >= 3 && minuteDir !== 0) {
+    const streakBullish = minuteDir > 0;
+    const nfDiverges = streakBullish ? netFlowSignal === 'bearish' : netFlowSignal === 'bullish';
+    const tickDiverges = streakBullish ? tickMomSignal === 'bearish' : tickMomSignal === 'bullish';
+    if (nfDiverges && tickDiverges) {
+      streakExhausting = true;
+      exhaustionReason = `${minuteStreak}× ${streakBullish ? '↑' : '↓'} but flow reversing`;
+    } else if (nfDiverges || tickDiverges) {
+      streakDampened = true;
+      exhaustionReason = `${minuteStreak}× ${streakBullish ? '↑' : '↓'} partial divergence`;
+    }
   }
 
   return {
@@ -2295,26 +2325,43 @@ function calcPolyMicroIndicators() {
     minuteDir,
     minuteSignal,
     netFlowVal,
+    netFlowSignal,
     windowDev,
     tickMom,
+    tickMomSignal,
     roc,
     macdHist,
     macdHistRising,
     lowVolatility,
     volRangePercent,
     currentPrice,
-    windowOpenPrice: polyWindowOpenPrice
+    windowOpenPrice: polyWindowOpenPrice,
+    // v3.1 fields
+    streakExhausting,
+    streakDampened,
+    exhaustionReason
   };
 }
 
-// ── Signal Scoring v3 ──
+// ── Signal Scoring v3.1 ──
 function calcPolymarketSignal(ind) {
-  // v3 point-based scoring, starting at 50 (neutral)
+  // v3.1 point-based scoring, starting at 50 (neutral)
   let score = 50;
 
   // 1. MinuteDirection Consistency (±20 pts + ±5 bonus for 4-streak)
-  if (ind.minuteStreak >= 3) score += ind.minuteDir * 20;
-  if (ind.minuteStreak >= 4) score += ind.minuteDir * 5;
+  // v3.1: Dampen if streak is exhausting
+  if (ind.minuteStreak >= 3) {
+    if (ind.streakExhausting) {
+      score += ind.minuteDir * 8; // dampened from 20 to 8
+    } else if (ind.streakDampened) {
+      score += ind.minuteDir * 14; // slightly dampened
+    } else {
+      score += ind.minuteDir * 20;
+    }
+  }
+  if (ind.minuteStreak >= 4 && !ind.streakExhausting) {
+    score += ind.minuteDir * 5;
+  }
 
   // 2. NetFlow (±10 pts)
   score += Math.max(-10, Math.min(10, ind.netFlowVal * 50));
@@ -2426,7 +2473,8 @@ function updatePolyPanel() {
     const streakInfo = ind.minuteStreak >= 3
       ? ` • streak: ${ind.minuteStreak}× ${ind.minuteDir > 0 ? '↑' : '↓'}`
       : '';
-    dataStatusEl.textContent = `v3 Live • ${polyTrades.length} trades • ${polyCandles1m.filter(c => c.closed).length} candles${streakInfo}`;
+    const exhaustInfo = ind.streakExhausting ? ' • ⚠ EXHAUSTION' : ind.streakDampened ? ' • ⚡ dampened' : '';
+    dataStatusEl.textContent = `v3.1 Live • ${polyTrades.length} trades • ${polyCandles1m.filter(c => c.closed).length} candles${streakInfo}${exhaustInfo}`;
   }
 
   const score = calcPolymarketSignal(ind);
@@ -2450,14 +2498,24 @@ function updatePolyPanel() {
   // Update signal text with v3 confidence logic
   const signalEl = document.getElementById('polySignalText');
   if (signalEl) {
-    // v3 confidence: HIGH needs streak≥3 + score≥65/≤35, MEDIUM needs streak≥2 + score≥58/≤42
+    // v3.1 confidence: HIGH needs streak≥3 + score≥65/≤35 + no exhaustion, MEDIUM needs streak≥2 + score≥62/≤38
     let confLevel = 'LOW';
-    if (ind.minuteStreak >= 3 && (score >= 65 || score <= 35)) confLevel = 'HIGH';
-    else if (ind.minuteStreak >= 2 && (score >= 58 || score <= 42)) confLevel = 'MED';
+    if (ind.minuteStreak >= 3 && (score >= 65 || score <= 35) && !ind.streakExhausting) confLevel = 'HIGH';
+    else if (ind.minuteStreak >= 2 && (score >= 62 || score <= 38)) confLevel = 'MED';
     if (ind.lowVolatility) confLevel = 'LOW';
 
+    // v3.1 CRITICAL: LOW confidence gate — force NEUTRAL (skip trade)
+    // LOW confidence was 25% accurate in live testing — worse than coin flip
+    const lowConfGated = confLevel === 'LOW';
+
     if (ind.lowVolatility) {
-      signalEl.textContent = 'LOW VOL — Skip trade';
+      signalEl.textContent = 'LOW VOL — Skip';
+      signalEl.style.color = '#9ca3af';
+    } else if (ind.streakExhausting) {
+      signalEl.textContent = '⚠ EXHAUSTION — Skip';
+      signalEl.style.color = '#fbbf24';
+    } else if (lowConfGated) {
+      signalEl.textContent = `LOW CONF — Skip (${score}/100)`;
       signalEl.style.color = '#9ca3af';
     } else if (label === 'NEUTRAL') {
       signalEl.textContent = 'NEUTRAL — No edge';
@@ -2536,6 +2594,15 @@ function polyRenderIndicators(ind) {
     }
   ];
 
+  // v3.1: Add exhaustion row if active
+  if (ind.streakExhausting || ind.streakDampened) {
+    rows.push({
+      name: '⚠ Exhaustion',
+      value: ind.exhaustionReason || 'Active',
+      signal: ind.streakExhausting ? 'down' : 'neutral'
+    });
+  }
+
   grid.innerHTML = rows.map(r => `
     <div class="poly-ind-row">
       <span class="poly-ind-name">${r.name}</span>
@@ -2554,6 +2621,7 @@ function polyRenderHistory() {
     let resultHtml = '<span style="color:#6b7280">—</span>';
     if (h.correct === true)  resultHtml = '<span class="poly-result-correct">✓</span>';
     if (h.correct === false) resultHtml = '<span class="poly-result-wrong">✗</span>';
+    if (h.gated) resultHtml = '<span style="color:#6b7280">skip</span>';
     const predColor = h.prediction.includes('UP') ? '#10b981' : h.prediction.includes('DOWN') ? '#ef4444' : '#9ca3af';
     const actualColor = h.actual === 'UP' ? '#10b981' : '#ef4444';
     return `<tr>
@@ -2564,8 +2632,9 @@ function polyRenderHistory() {
     </tr>`;
   }).join('');
 
-  // Accuracy stat
+  // Accuracy stat — only counts non-gated, non-neutral predictions
   const judged = polySessionHistory.filter(h => h.correct !== null);
+  const skipped = polySessionHistory.filter(h => h.gated).length;
   if (accEl) {
     if (judged.length === 0) {
       accEl.textContent = 'No completed windows yet';
@@ -2573,7 +2642,8 @@ function polyRenderHistory() {
     } else {
       const correct = judged.filter(h => h.correct).length;
       const pct = Math.round((correct / judged.length) * 100);
-      accEl.textContent = `${correct}/${judged.length} • ${pct}% accuracy`;
+      const skipNote = skipped > 0 ? ` • ${skipped} skipped` : '';
+      accEl.textContent = `${correct}/${judged.length} • ${pct}% accuracy${skipNote}`;
       accEl.style.color = pct >= 55 ? '#10b981' : pct >= 45 ? '#fbbf24' : '#ef4444';
     }
   }
